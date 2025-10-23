@@ -117,5 +117,5 @@ You can edit or add playlists in the `YOUTUBE_PLAYLISTS` section inside the scri
 
 ## 🧑‍💻 Author
 
-Created by **Smash**  
+Created by **lilsmash720**  
 For VR cinema and nostalgic TV streaming setups.
