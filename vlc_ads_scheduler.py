@@ -18,6 +18,7 @@ POLL_INTERVAL    = 1.0
 YTDLP_RETRIES    = 4
 
 ad_player_pids: set[int] = set()
+skip_flag = threading.Event()     # <-- NEW: signal to abort an ad break immediately
 
 # ==== YouTube Playlists ====
 YOUTUBE_PLAYLISTS = {
@@ -93,6 +94,34 @@ def ensure_fullscreen(port, pw, desired=True):
     if desired and not is_fs:
         vlc_cmd(port, pw, "fullscreen")
 
+# ==== Skip Ads ====
+def skip_ads(port=None, pw=None):
+    """Immediately terminate all current ad players, abort the ad loop, and resume main playback."""
+    global ad_player_pids, skip_flag
+    skip_flag.set()  # tell play_ad_break to stop
+    print("[ads] Skipping all current ads...")
+
+    for pid in list(ad_player_pids):
+        try:
+            proc = psutil.Process(pid)
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        ad_player_pids.discard(pid)
+
+    # Resume main VLC playback
+    if port and pw:
+        try:
+            vlc_cmd(port, pw, "pl_forceresume")
+            ensure_fullscreen(port, pw, True)
+            print("[ads] Resumed main playback after skipping ads.")
+        except Exception as e:
+            print(f"[ads] Could not resume playback: {e}")
+
 # ==== YouTube (no-lua) Direct Stream Resolve ====
 def _ydl_for_playlist():
     return yt_dlp.YoutubeDL({
@@ -157,9 +186,7 @@ def resolve_random_stream_from_playlists(decade: str):
                                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
             headers.setdefault("Referer", "https://www.youtube.com/")
             dur = int(vi.get("duration") or 0)
-            start = 0
-            if dur > 60:
-                start = random.randint(0, max(1, dur - 30))
+            start = random.randint(0, max(1, dur - 30)) if dur > 60 else 0
             print("[yt] got direct stream")
             return stream_url, headers, start
         plists.append(plists.pop(0))
@@ -186,16 +213,23 @@ def play_ad(vlc_path, source, headers=None, start_seconds=0):
     return proc
 
 def play_ad_break(folder, vlc_path, decade="90s", first_break=False):
+    """Play 2–3 minutes of ads. Aborts immediately if skip_flag is set."""
+    global skip_flag
+    skip_flag.clear()  # reset at the start of each ad break
+
     local_ads = []
     if os.path.isdir(folder):
         local_ads = [f for f in os.listdir(folder)
                      if f.lower().endswith((".mp4", ".mkv", ".avi", ".mov"))]
     use_youtube = (len(local_ads) == 0)
+
     if first_break and local_ads:
         print("[ads] found local files:", local_ads)
+
     total = 0.0
     print("[ads] Starting ad break (2–3 min)")
-    while total < AD_MIN:
+
+    while total < AD_MIN and not skip_flag.is_set():
         if use_youtube:
             src, hdrs, start = resolve_random_stream_from_playlists(decade)
             if not src:
@@ -206,19 +240,32 @@ def play_ad_break(folder, vlc_path, decade="90s", first_break=False):
             ad = random.choice(local_ads)
             src = os.path.join(folder, ad)
             p = play_ad(vlc_path, src)
-        while p.poll() is None and total < AD_MAX:
+
+        # Run the current ad, but stop if user presses Skip or we hit AD_MAX
+        while p.poll() is None and total < AD_MAX and not skip_flag.is_set():
             time.sleep(0.25)
             total += 0.25
-            if total >= AD_MAX:
-                try:
-                    p.terminate(); p.wait(timeout=2)
-                except Exception:
-                    try: p.kill()
-                    except Exception: pass
-                break
-        if p.poll() is None:
-            p.wait()
+
+        # Stop current ad process if still alive
+        try:
+            if p.poll() is None:
+                p.terminate()
+                p.wait(timeout=2)
+        except Exception:
+            try: p.kill()
+            except Exception: pass
+
         ad_player_pids.discard(p.pid)
+
+        if skip_flag.is_set():
+            print("[ads] Ad break aborted by user skip.")
+            break
+
+        # If we reached AD_MAX naturally, end this ad break immediately
+        if total >= AD_MAX:
+            print("[ads] Reached hard cap; ending ad break.")
+            break
+
     print(f"[ads] End of ad break ({int(total)}s)\n")
 
 # ==== Process watch ====
@@ -246,6 +293,7 @@ def run_episode(pid, cfg):
     print(f"[core] Detected show PID {pid}")
     if not vlc_ready(port, pw, 20):
         raise RuntimeError("VLC web interface not reachable.")
+
     # Pre-roll
     vlc_cmd(port, pw, "pl_forcepause")
     vlc_cmd(port, pw, "seek", "0")
@@ -253,7 +301,7 @@ def run_episode(pid, cfg):
     vlc_cmd(port, pw, "pl_forceresume")
     ensure_fullscreen(port, pw, True)
 
-    # Mid-rolls
+    # Mid-roll schedule
     if watch_type == "Movie":
         mid_min = mid_max = MOVIE_MID
     else:
@@ -262,21 +310,41 @@ def run_episode(pid, cfg):
     next_break = random.randint(mid_min, mid_max)
     print(f"[core] Next mid-roll in {next_break // 60} min")
 
+    idle_counter = 0
     while psutil.pid_exists(pid):
-        t = vlc_time(port, pw)
-        if t is not None and t >= next_break:
+        status = vlc_status(port, pw)
+        if not status:
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        state = status.get("state", "")
+        time_pos = status.get("time", 0)
+
+        # Mid-roll trigger
+        if state == "playing" and time_pos and time_pos >= next_break:
             print("[core] Mid-roll triggered")
             vlc_cmd(port, pw, "pl_forcepause")
             play_ad_break(folder, vlc_path, decade)
             vlc_cmd(port, pw, "pl_forceresume")
             ensure_fullscreen(port, pw, True)
             next_break += random.randint(mid_min, mid_max)
-            print(f"[core] Next mid-roll in {(next_break - t) // 60} min")
+            print(f"[core] Next mid-roll in {(next_break - time_pos) // 60} min")
+
+        # End detection
+        if state in ("stopped", "ended"):
+            idle_counter += 1
+        else:
+            idle_counter = 0
+
+        if idle_counter > 4:
+            print("[core] Playback finished (VLC idle). Running post-roll ads...")
+            play_ad_break(folder, vlc_path, decade)
+            print("[core] Post-roll ads complete. Done!\n")
+            return
+
         time.sleep(POLL_INTERVAL)
 
-    print("[core] Post-roll")
-    play_ad_break(folder, vlc_path, decade)
-    print("[core] Done\n")
+    print("[core] VLC closed unexpectedly, no post-roll triggered.\n")
 
 # ==== Watcher thread ====
 def watcher(stop_event, cfg, log):
@@ -300,7 +368,7 @@ class GUI:
     def __init__(self, root):
         self.root = root
         root.title("VLC Ad Scheduler")
-        root.geometry("560x420")
+        root.geometry("580x430")
         root.resizable(False, False)
         f = ttk.Frame(root)
         f.pack(fill="both", expand=True, padx=10, pady=8)
@@ -336,8 +404,11 @@ class GUI:
 
         self.start_btn = ttk.Button(f, text="▶️ Start", command=self.start_w)
         self.stop_btn  = ttk.Button(f, text="⏹ Stop", command=self.stop_w, state="disabled")
+        self.skip_btn  = ttk.Button(f, text="⏭ Skip Ads", command=self.skip_ads_pressed, state="disabled")
+
         self.start_btn.grid(row=6, column=0, pady=8)
         self.stop_btn.grid(row=6, column=1, sticky="w", pady=8)
+        self.skip_btn.grid(row=6, column=2, sticky="w", pady=8)
 
         self.status = tk.Label(f, text="Stopped", fg="red")
         self.status.grid(row=7, column=0, columnspan=3, sticky="w")
@@ -380,6 +451,7 @@ class GUI:
         self.thread.start()
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
+        self.skip_btn.config(state="normal")
         self.status.config(text="Running", fg="green")
         self.logw(f"Watching VLC... (ads: local folder or {self.decade_var.get()} YouTube playlists, {self.type_var.get()} mode)")
 
@@ -388,8 +460,18 @@ class GUI:
             self.stop_ev.set()
         self.start_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
+        self.skip_btn.config(state="disabled")
         self.status.config(text="Stopped", fg="red")
         self.logw("Stopped.")
+
+    def skip_ads_pressed(self):
+        try:
+            port = int(self.port_var.get())
+        except ValueError:
+            port = VLC_PORT
+        pw = self.pass_var.get()
+        skip_ads(port, pw)
+        self.logw("User skipped ads — playback resumed.")
 
 def main():
     root = tk.Tk()
